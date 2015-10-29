@@ -59,7 +59,6 @@ class ActionScheduler_QueueRunner {
 			$actions_run = $this->do_batch( $batch_size );
 			unset( $this->monitor );
 		}
-
 		do_action( 'action_scheduler_after_process_queue' );
 		return $count;
 	}
@@ -136,4 +135,4 @@ class ActionScheduler_QueueRunner {
 		return $schedules;
 	}
 }
- 
+

@@ -60,6 +60,7 @@ class ActionScheduler_QueueCleaner {
 			'status' => ActionScheduler_Store::STATUS_RUNNING,
 			'modified' => $cutoff,
 			'modified_compare' => '<=',
+			'claimed' => TRUE,
 			'per_page' => apply_filters( 'action_scheduler_cleanup_batch_size', 20 ),
 		) );
 

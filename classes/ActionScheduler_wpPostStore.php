@@ -5,6 +5,7 @@
  */
 class ActionScheduler_wpPostStore extends ActionScheduler_Store {
 	const POST_TYPE = 'scheduled-action';
+	const CLAIM_POST_TYPE = 'action-claim';
 	const GROUP_TAXONOMY = 'action-group';
 	const SCHEDULE_META_KEY = '_action_manager_schedule';
 
@@ -257,11 +258,11 @@ class ActionScheduler_wpPostStore extends ActionScheduler_Store {
 		}
 
 		if ( $query['claimed'] === TRUE ) {
-			$sql .= " AND p.post_password != ''";
+			$sql .= " AND p.post_parent != 0";
 		} elseif ( $query['claimed'] === FALSE ) {
-			$sql .= " AND p.post_password = ''";
+			$sql .= " AND p.post_parent = 0";
 		} elseif ( !is_null($query['claimed']) ) {
-			$sql .= " AND p.post_password = %s";
+			$sql .= " AND p.post_parent = %d";
 			$sql_params[] = $query['claimed'];
 		}
 
@@ -355,7 +356,10 @@ class ActionScheduler_wpPostStore extends ActionScheduler_Store {
 	 * @return ActionScheduler_ActionClaim
 	 */
 	public function stake_claim( $max_actions = 10, DateTime $before_date = NULL ){
-		$claim_id = $this->generate_claim_id();
+		$claim_id = $this->reserve_free_claim_id();
+		if ( empty($claim_id) ) {
+			return new ActionScheduler_NullActionClaim(NULL, array());
+		}
 		$this->claim_actions( $claim_id, $max_actions, $before_date );
 		$action_ids = $this->find_actions_by_claim_id( $claim_id );
 		return new ActionScheduler_ActionClaim( $claim_id, $action_ids );
@@ -365,17 +369,93 @@ class ActionScheduler_wpPostStore extends ActionScheduler_Store {
 	 * @return int
 	 */
 	public function get_claim_count(){
+		/** @var wpdb $wpdb */
 		global $wpdb;
 
-		$sql = "SELECT COUNT(DISTINCT post_password) FROM {$wpdb->posts} WHERE post_password != '' AND post_type = %s AND post_status IN ('in-progress','pending')";
-		$sql = $wpdb->prepare( $sql, array( self::POST_TYPE ) );
+		$sql = "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type=%s AND post_status=%s";
+		$sql = $wpdb->prepare( $sql, self::CLAIM_POST_TYPE, 'pending' );
 
-		return $wpdb->get_var( $sql );
+		$count = $wpdb->get_var( $sql );
+		return $count;
 	}
 
-	protected function generate_claim_id() {
-		$claim_id = md5(microtime(true) . rand(0,1000));
-		return substr($claim_id, 0, 20); // to fit in db field with 20 char limit
+	/**
+	 * @return string The reserved claim ID
+	 */
+	protected function reserve_free_claim_id() {
+		/** @var wpdb $wpdb */
+		global $wpdb;
+		$id = $this->get_free_claim_id();
+		$updated = $wpdb->update($wpdb->posts, array('post_status' => 'pending'), array('ID'=> $id, 'post_status' => 'publish'), array('%s'), array('%d', '%s'));
+		if ( $updated ) {
+			return $id;
+		}
+		return '';
+	}
+
+	/**
+	 * @return string The ID of a free claim
+	 */
+	protected function get_free_claim_id() {
+		/** @var wpdb $wpdb */
+		global $wpdb;
+		$this->generate_claims();
+		$free_claims = $wpdb->get_var($wpdb->prepare("SELECT ID FROM {$wpdb->posts} WHERE post_type=%s AND post_status=%s LIMIT 1", self::CLAIM_POST_TYPE, 'publish'));
+		return $free_claims;
+	}
+
+	/**
+	 * Create enough claim posts to match the 'action_scheduler_max_claims' filter
+	 *
+	 * @uses apply_filters('action_scheduler_max_claims', $max claims)
+	 * @return void
+	 */
+	protected function generate_claims() {
+		/** @var wpdb $wpdb */
+		global $wpdb;
+
+		$existing_claims = $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type=%s", self::CLAIM_POST_TYPE ) );
+		$max_claims = apply_filters('action_scheduler_max_claims', 5);
+
+		if ( $existing_claims == $max_claims ) {
+			return;
+		}
+		if ( $existing_claims > $max_claims ) {
+			$this->prune_claims( $max_claims );
+			return;
+		}
+
+		add_filter( 'wp_insert_post_data', array( $this, 'filter_insert_post_data' ), 10, 1 );
+		for ( $i = $existing_claims ; $i < $max_claims ; $i++ ) {
+			wp_insert_post(array(
+				'post_type' => self::CLAIM_POST_TYPE,
+				'post_status' => 'publish'
+			));
+		}
+		remove_filter( 'wp_insert_post_data', array( $this, 'filter_insert_post_data' ), 10, 1 );
+	}
+
+	/**
+	 * If we have too many claims in the DB (e.g., if we changed the number
+	 * allowed to a smaller number, prune them down to a smaller set)
+	 *
+	 * @param int $max The maximum number to allow to remain
+	 * @return void
+	 */
+	protected function prune_claims( $max ) {
+		/** @var wpdb $wpdb */
+		global $wpdb;
+		$locked_claims = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_type=%s AND post_status=%s ORDER BY ID DESC", self::CLAIM_POST_TYPE, 'pending' ) );
+		$free_claims = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_type=%s AND post_status=%s ORDER BY ID DESC", self::CLAIM_POST_TYPE, 'publish' ) );
+
+		$total = count($locked_claims) + count($free_claims);
+		$number_to_remove = $total - $max;
+		for ( $i = 0 ; $i < $number_to_remove ; $i++ ) {
+			if ( !isset($free_claims[$i]) ) {
+				break; // if we're out of free claims, don't delete any more. They'll be deleted in the future when they're free.
+			}
+			wp_delete_post( $free_claims[$i], TRUE );
+		}
 	}
 
 	/**
@@ -391,7 +471,7 @@ class ActionScheduler_wpPostStore extends ActionScheduler_Store {
 		$date = is_null($before_date) ? new DateTime() : clone( $before_date );
 		$date->setTimezone( $this->get_local_timezone() ); // using post_modified to take advantage of indexes
 		// can't use $wpdb->update() because of the <= condition
-		$sql = "UPDATE {$wpdb->posts} SET post_password = %s, post_modified_gmt = %s, post_modified = %s WHERE post_type = %s AND post_status = %s AND post_password = '' AND post_date <= %s ORDER BY menu_order ASC, post_date ASC LIMIT %d";
+		$sql = "UPDATE {$wpdb->posts} SET post_parent = %d, post_modified_gmt = %s, post_modified = %s WHERE post_type = %s AND post_status = %s AND post_parent = '' AND post_date <= %s ORDER BY menu_order ASC, post_date ASC LIMIT %d";
 		$sql = $wpdb->prepare( $sql, array( $claim_id, current_time('mysql', true), current_time('mysql'), self::POST_TYPE, 'pending', $date->format('Y-m-d H:i:s'), $limit ) );
 		$rows_affected = $wpdb->query($sql);
 		if ( $rows_affected === false ) {
@@ -407,25 +487,27 @@ class ActionScheduler_wpPostStore extends ActionScheduler_Store {
 	public function find_actions_by_claim_id( $claim_id ) {
 		/** @var wpdb $wpdb */
 		global $wpdb;
-		$sql = "SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_password = %s";
+		$sql = "SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_parent = %d";
 		$sql = $wpdb->prepare( $sql, array( self::POST_TYPE, $claim_id ) );
 		$action_ids = $wpdb->get_col( $sql );
 		return $action_ids;
 	}
 
 	public function release_claim( ActionScheduler_ActionClaim $claim ) {
-		$action_ids = $this->find_actions_by_claim_id( $claim->get_id() );
-		if ( empty($action_ids) ) {
-			return; // nothing to do
-		}
-		$action_id_string = implode(',', array_map('intval', $action_ids));
 		/** @var wpdb $wpdb */
 		global $wpdb;
-		$sql = "UPDATE {$wpdb->posts} SET post_password = '' WHERE ID IN ($action_id_string) AND post_password = %s";
-		$sql = $wpdb->prepare( $sql, array( $claim->get_id() ) );
-		$result = $wpdb->query($sql);
-		if ( $result === false ) {
-			throw new RuntimeException( sprintf( __('Unable to unlock claim %s. Database error.', 'action-scheduler'), $claim->get_id() ) );
+		$action_ids = $this->find_actions_by_claim_id( $claim->get_id() );
+		if ( $claim->get_id() && !empty($action_ids) ) {
+			$action_id_string = implode(',', array_map('intval', $action_ids));
+			$sql = "UPDATE {$wpdb->posts} SET post_parent = 0 WHERE ID IN ($action_id_string) AND post_parent = %d";
+			$sql = $wpdb->prepare( $sql, array( $claim->get_id() ) );
+			$result = $wpdb->query($sql);
+			if ( $result === false ) {
+				throw new RuntimeException( sprintf( __('Unable to unlock claim %s. Database error.', 'action-scheduler'), $claim->get_id() ) );
+			}
+		}
+		if ( $claim->get_id() ) {
+			$wpdb->update($wpdb->posts, array('post_status' => 'publish'), array('ID' => $claim->get_id()), array('%s'), array('%d'));
 		}
 	}
 
@@ -437,7 +519,7 @@ class ActionScheduler_wpPostStore extends ActionScheduler_Store {
 	public function unclaim_action( $action_id ) {
 		/** @var wpdb $wpdb */
 		global $wpdb;
-		$sql = "UPDATE {$wpdb->posts} SET post_password = '' WHERE ID = %d AND post_type = %s";
+		$sql = "UPDATE {$wpdb->posts} SET post_parent = 0 WHERE ID = %d AND post_type = %s";
 		$sql = $wpdb->prepare( $sql, $action_id, self::POST_TYPE );
 		$result = $wpdb->query($sql);
 		if ( $result === false ) {
